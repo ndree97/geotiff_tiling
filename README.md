@@ -2,6 +2,9 @@
 
 Uno strumento Python per convertire automaticamente ortofoto georeferenziate e rilievi fotogrammetrici in **Map Tiles XYZ (Web Mercator)** pronte per essere visualizzate su **Google Maps**, **Leaflet** o **OpenLayers**, utilizzando GDAL e `gdal2tiles`.
 
+[![GitHub stars](https://img.shields.io/github/stars/ndree97/geotiff_tiling?style=flat-square)](https://github.com/ndree97/geotiff_tiling/stargazers)
+[![GitHub issues](https://img.shields.io/github/issues/ndree97/geotiff_tiling?style=flat-square)](https://github.com/ndree97/geotiff_tiling/issues)
+[![GitHub repo size](https://img.shields.io/github/repo-size/ndree97/geotiff_tiling?style=flat-square)](https://github.com/ndree97/geotiff_tiling)
 ---
 
 ## ✨ Funzionalità
