@@ -1,0 +1,7 @@
+# Core GIS dependencies
+# Note: On Windows, GDAL is often best installed via conda, OSGeo4W, or pre-built wheels from Christoph Gohlke
+GDAL>=3.6.0
+rasterio>=1.3.0
+
+# Web preview server
+Flask>=2.0.0
