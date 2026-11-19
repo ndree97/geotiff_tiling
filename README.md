@@ -59,6 +59,24 @@ Usa questa modalità se disponi già di un raster GeoTIFF georeferenziato:
 python main.py -i /percorso/ortofoto.tif -z 15-22 -p 4
 ```
 
+### 1b. Raster non georeferenziato (posizionamento approssimato)
+Per un'immagine senza coordinate (es. disegno tecnico scansionato) puoi **stimare** la posizione: dai un punto, la scala del disegno e una rotazione. I DPI sono letti dal TIFF (`--dpi` per forzarli).
+
+```bash
+python main.py -i disegno.tif --place 40.84022778 14.09117778 --scale 100 --rotation 0 --crop 1700 250 4300 2550 -z 18-22
+```
+
+| Opzione | Significato |
+| :--- | :--- |
+| `--place LAT LON` | punto su cui cade il centro del raster (o del ritaglio) |
+| `--anchor-px X Y` | pixel dell'immagine intera da far cadere sul punto (default: centro) |
+| `--scale` | denominatore della scala del disegno (default `100` = 1:100) |
+| `--rotation` | gradi in senso orario di cui la parte alta del disegno è ruotata rispetto al nord |
+| `--crop X Y W H` | usa solo un ritaglio (pixel dell'immagine intera) |
+
+> [!WARNING]
+> Non è una vera georeferenziazione (nessun punto di controllo, nessuna deformazione): serve a capire se un file è utilizzabile. Per un risultato preciso usa il Georeferencer di QGIS. Nella GUI, con il posizionamento attivo, l'anteprima fonde il disegno con la mappa (il bianco diventa trasparente) per verificare la posizione.
+
 ### 2. Modalità Directory (File Grezzi Fotogrammetria)
 Usa questa modalità se hai una cartella contenente i tre file separati (`.tif`, `.tfw`, `.prj`):
 

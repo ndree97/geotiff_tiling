@@ -5,6 +5,7 @@ import subprocess
 import threading
 import argparse
 from osgeo import gdal, osr
+import georef
 
 # --- CONFIGURAZIONE ---
 # Cartella di destinazione dove verranno salvate le tiles
@@ -225,16 +226,22 @@ def create_map_tiles_workflow(input_file, output_dir, zoom, processes,
 
     # Il VRT a 8-bit serve solo se la sorgente non è già Byte: -scale su un Byte altera i colori.
     src = gdal.Open(input_file)
+    if src.GetGeoTransform() == (0.0, 1.0, 0.0, 0.0, 0.0, 1.0) and not src.GetGCPCount():
+        print("Errore: il raster non è georeferenziato (nessun geotransform/GCP e nessun .tfw accanto).")
+        print("Georeferenzialo (es. QGIS), usa -d con una cartella .tif + .tfw + .prj, oppure --place LAT LON per un posizionamento approssimato.")
+        return
     is_byte = src.GetRasterBand(1).DataType == gdal.GDT_Byte
+    palette = src.GetRasterBand(1).GetColorTable() is not None  # gdal2tiles vuole RGB/RGBA
     src = None
 
     temp_vrt_file = None
     tiling_input = input_file
-    if not is_byte:
+    if palette or not is_byte:
         temp_vrt_file = os.path.splitext(input_file)[0] + "_8bit.vrt"
         print("\n--- PASSAGGIO 1: Conversione del file in formato 8-bit (virtuale) ---")
         translate_command = [
-            'gdal_translate', '-ot', 'Byte', '-scale', '-of', 'VRT',
+            'gdal_translate', '-of', 'VRT',
+            *(['-expand', 'rgba'] if palette else ['-ot', 'Byte', '-scale']),
             input_file, temp_vrt_file
         ]
         print(f"Esecuzione del comando: {' '.join(translate_command)}\n")
@@ -304,6 +311,19 @@ def main():
                        help='Algoritmo di resampling (default: near, il più veloce)')
     parser.add_argument('--resume', action='store_true',
                        help='Riprende una generazione interrotta creando solo le tiles mancanti')
+    parser.add_argument('--place', type=float, nargs=2, metavar=('LAT', 'LON'),
+                       help='Posiziona in modo APPROSSIMATO un raster non georeferenziato (es. disegno scansionato): '
+                            'il centro (o --anchor-px) cade su LAT LON. Solo con -i')
+    parser.add_argument('--scale', type=float, default=100,
+                       help='Con --place: denominatore della scala del disegno (default: 100 = 1:100)')
+    parser.add_argument('--rotation', type=float, default=0,
+                       help='Con --place: gradi in senso orario di cui la parte alta del disegno è ruotato rispetto al nord')
+    parser.add_argument('--dpi', type=float, default=None,
+                       help='Con --place: DPI della scansione (default: letti dal TIFF)')
+    parser.add_argument('--crop', type=int, nargs=4, metavar=('X', 'Y', 'W', 'H'),
+                       help='Con --place: usa solo questo ritaglio (pixel dell immagine intera)')
+    parser.add_argument('--anchor-px', type=float, nargs=2, metavar=('X', 'Y'),
+                       help='Con --place: pixel (immagine intera) che cade su LAT LON (default: centro del ritaglio)')
     parser.add_argument('--target-crs', type=str, default=None,
                        help='Verifica corrispondenza CRS atteso (es. EPSG:32633 o EPSG:3857, opzionale)')
 
@@ -328,6 +348,14 @@ def main():
         if not os.path.exists(input_file):
             print(f"Errore: Il file '{input_file}' non esiste.")
             sys.exit(1)
+        if args.place:
+            try:
+                input_file = georef.place_raster(input_file, *args.place, scale=args.scale, rotation=args.rotation,
+                                                 dpi=args.dpi, crop=args.crop, anchor_px=args.anchor_px)
+            except ValueError as e:
+                print(f"Errore: {e}")
+                sys.exit(1)
+            print("\nATTENZIONE: posizionamento APPROSSIMATO (senza punti di controllo): verifica sempre la posizione sulla mappa.")
 
     # Costruzione del percorso di output dinamico
     input_basename = os.path.splitext(os.path.basename(input_file))[0]

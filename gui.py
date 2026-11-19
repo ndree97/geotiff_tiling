@@ -7,10 +7,11 @@ from PySide6.QtWebEngineCore import QWebEngineSettings
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QFileDialog, QFormLayout, QHBoxLayout,
-    QLineEdit, QPlainTextEdit, QProgressBar, QPushButton, QRadioButton,
+    QDoubleSpinBox, QLineEdit, QPlainTextEdit, QProgressBar, QPushButton, QRadioButton,
     QSpinBox, QSplitter, QVBoxLayout, QWidget,
 )
 
+import georef
 from preview import Preview
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -41,6 +42,22 @@ class Window(QWidget):
         self.resampling = QComboBox(); self.resampling.addItems(["near", "bilinear", "cubic", "cubicspline", "lanczos", "average"])
         self.resume = QCheckBox("Riprendi (solo tiles mancanti)")
 
+        # Posizionamento approssimato di raster non georeferenziati (disegni scansionati)
+        self.place_on = QCheckBox("Posiziona raster non georeferenziato (approssimato)")
+        self.place_ll = QLineEdit(); self.place_ll.setPlaceholderText("LAT, LON   es. 40.84022778, 14.09117778")
+        self.scale = QDoubleSpinBox(); self.scale.setRange(1, 1_000_000); self.scale.setDecimals(0); self.scale.setValue(100)
+        self.scale.setPrefix("1:")
+        self.rot = QDoubleSpinBox(); self.rot.setRange(-360, 360); self.rot.setDecimals(1); self.rot.setSuffix(" ° orari dal nord")
+        self.crop = QLineEdit(); self.crop.setPlaceholderText("X Y W H in pixel (vuoto = tutta l immagine)")
+        self.anchor = QLineEdit(); self.anchor.setPlaceholderText("X Y del pixel sul punto (vuoto = centro)")
+        self.place_box = QWidget(); pform = QFormLayout(self.place_box); pform.setContentsMargins(0, 0, 0, 0)
+        for label, w in (("Punto", self.place_ll), ("Scala disegno", self.scale), ("Rotazione", self.rot),
+                         ("Ritaglio", self.crop), ("Ancora", self.anchor)):
+            pform.addRow(label, w)
+        self.place_box.setEnabled(False)
+        self.place_on.toggled.connect(self.place_box.setEnabled)
+        self.dir_mode.toggled.connect(lambda on: (self.place_on.setChecked(False), self.place_on.setEnabled(not on)))
+
         form = QFormLayout()
         mode = QHBoxLayout(); mode.addWidget(self.file_mode); mode.addWidget(self.dir_mode)
         form.addRow("Sorgente", mode)
@@ -53,6 +70,8 @@ class Window(QWidget):
         form.addRow("Formato", self.fmt)
         form.addRow("Resampling", self.resampling)
         form.addRow("", self.resume)
+        form.addRow(self.place_on)
+        form.addRow(self.place_box)
 
         self.start = QPushButton("Avvia"); self.start.clicked.connect(self.run)
         self.cancel = QPushButton("Annulla"); self.cancel.setEnabled(False); self.cancel.clicked.connect(self.stop)
@@ -100,9 +119,35 @@ class Window(QWidget):
         if path:
             self.output.setText(os.path.normpath(path))
 
+    def _place_args(self):
+        """None se il posizionamento è spento, altrimenti i parametri per georef.place_raster. ValueError se non validi."""
+        if not self.place_on.isChecked():
+            return None
+
+        def nums(text, n, what):
+            try:
+                v = [float(x) for x in text.replace(",", " ").split()]
+            except ValueError:
+                v = []
+            if len(v) != n:
+                raise ValueError(f"{what}: servono {n} numeri")
+            return v
+
+        lat, lon = nums(self.place_ll.text(), 2, "Punto (LAT, LON)")
+        crop = self.crop.text().strip()
+        anchor = self.anchor.text().strip()
+        return dict(lat=lat, lon=lon, scale=self.scale.value(), rotation=self.rot.value(),
+                    crop=tuple(int(x) for x in nums(crop, 4, "Ritaglio")) if crop else None,
+                    anchor_px=tuple(nums(anchor, 2, "Ancora")) if anchor else None)
+
     def run(self):
         if not self.input.text().strip():
             self.log.appendPlainText("Seleziona un input.")
+            return
+        try:
+            place = self._place_args()
+        except ValueError as e:
+            self.log.appendPlainText(str(e))
             return
         if self.zmin.value() > self.zmax.value():
             self.log.appendPlainText("Zoom min deve essere <= zoom max.")
@@ -119,6 +164,13 @@ class Window(QWidget):
         ]
         if self.resume.isChecked():
             args.append("--resume")
+        if place:
+            args += ["--place", str(place["lat"]), str(place["lon"]), "--scale", str(place["scale"]),
+                     "--rotation", str(place["rotation"])]
+            if place["crop"]:
+                args += ["--crop", *map(str, place["crop"])]
+            if place["anchor_px"]:
+                args += ["--anchor-px", *map(str, place["anchor_px"])]
 
         # Rende gdal2tiles/gdal_translate trovabili anche senza "conda activate".
         env = QProcessEnvironment.systemEnvironment()
@@ -170,6 +222,11 @@ class Window(QWidget):
         return tif, os.path.join(self.output.text().strip(), f"{base}_{zoom}")
 
     def refresh_preview(self):
+        try:
+            place = self._place_args()
+        except ValueError as e:
+            self.log.appendPlainText(str(e))
+            return
         tif, tiles = self._tif_and_tiles()
         if not os.path.isfile(tif):
             self.log.appendPlainText(f"Anteprima: file non trovato ({tif}). In modalità cartella esiste dopo la prima generazione.")
@@ -177,11 +234,12 @@ class Window(QWidget):
         self.show_prev.setEnabled(False)
         self.log.appendPlainText("Anteprima: preparo l'overview del GeoTIFF…")
         args = dict(scheme=self.scheme.currentText(), ext=self.fmt.currentText().replace("jpeg", "jpg"),
-                    zmin=self.zmin.value(), zmax=self.zmax.value())
+                    zmin=self.zmin.value(), zmax=self.zmax.value(), multiply=bool(place))
 
         def work():  # l'overview di un raster grande può richiedere secondi: fuori dal thread GUI
             try:
-                self.preview_ready.emit(self.preview.build(tif, tiles, **args))
+                src = georef.place_raster(tif, **place) if place else tif
+                self.preview_ready.emit(self.preview.build(src, tiles, **args))
             except Exception as e:
                 self.preview_ready.emit(f"!{e}")
         threading.Thread(target=work, daemon=True).start()
