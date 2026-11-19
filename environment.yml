@@ -1,0 +1,8 @@
+name: geotiff-tiling
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - gdal>=3.8
+  - rasterio
+  - flask

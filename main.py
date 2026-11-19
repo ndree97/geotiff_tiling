@@ -14,7 +14,7 @@ output_folder = "output_tiles"
 zoom_levels = "15-25"
 
 # Numero di processi da usare in parallelo
-num_processes = 5
+num_processes = os.cpu_count() or 4
 
 # --------------------
 
@@ -213,49 +213,58 @@ def create_georeferenced_tif(directory, output_path, target_epsg=None):
         return None
 
 
-def create_map_tiles_workflow(input_file, output_dir, zoom, processes):
+def create_map_tiles_workflow(input_file, output_dir, zoom, processes,
+                              scheme="xyz", tile_format="png", resampling="near", resume=False):
     """
     Workflow completo e monitorabile per la creazione di map tiles.
+    scheme: 'xyz' (Google Maps, OpenStreetMap, Leaflet, MapLibre) o 'tms' (Y invertita).
     """
     if not os.path.exists(input_file):
         print(f"Errore: Il file di input '{input_file}' non è stato trovato.")
         return
 
-    temp_vrt_file = os.path.splitext(input_file)[0] + "_8bit.vrt"
+    # Il VRT a 8-bit serve solo se la sorgente non è già Byte: -scale su un Byte altera i colori.
+    src = gdal.Open(input_file)
+    is_byte = src.GetRasterBand(1).DataType == gdal.GDT_Byte
+    src = None
 
-    print("\n--- PASSAGGIO 1: Conversione del file in formato 8-bit (virtuale) ---")
-    translate_command = [
-        'gdal_translate', '-ot', 'Byte', '-scale', '-of', 'VRT',
-        input_file, temp_vrt_file
-    ]
+    temp_vrt_file = None
+    tiling_input = input_file
+    if not is_byte:
+        temp_vrt_file = os.path.splitext(input_file)[0] + "_8bit.vrt"
+        print("\n--- PASSAGGIO 1: Conversione del file in formato 8-bit (virtuale) ---")
+        translate_command = [
+            'gdal_translate', '-ot', 'Byte', '-scale', '-of', 'VRT',
+            input_file, temp_vrt_file
+        ]
+        print(f"Esecuzione del comando: {' '.join(translate_command)}\n")
+        if run_command_with_progress(translate_command) != 0:
+            print("\n--- ERRORE durante la conversione a 8-bit ---")
+            return
+        tiling_input = temp_vrt_file
 
-    print(f"Esecuzione del comando: {' '.join(translate_command)}\n")
-
-    if run_command_with_progress(translate_command) != 0:
-        print("\n--- ERRORE durante la conversione a 8-bit ---")
-        return
-
-    print(f"\nFile virtuale '{temp_vrt_file}' creato con successo.")
-
-    print("\n--- PASSAGGIO 2: Generazione delle tiles dal file 8-bit ---")
+    print("\n--- Generazione delle tiles ---")
     start_time = time.time()
 
     tiles_command = [
         'gdal2tiles',
         '--profile', 'mercator',
-        '--resampling', 'near',
+        '--resampling', resampling,
         '--zoom', zoom,
         '--processes', str(processes),
-        '--xyz',
-        temp_vrt_file,
-        output_dir
+        '--tiledriver', tile_format.upper(),
+        '--exclude',  # salta le tiles completamente trasparenti: meno I/O e meno file
     ]
+    if scheme == "xyz":
+        tiles_command.append('--xyz')
+    if resume:
+        tiles_command.append('--resume')
+    tiles_command += [tiling_input, output_dir]
 
     print(f"Esecuzione del comando: {' '.join(tiles_command)}\n")
 
     if run_command_with_progress(tiles_command) == 0:
-        end_time = time.time()
-        elapsed_time = end_time - start_time
+        elapsed_time = time.time() - start_time
         print("\n--- Generazione completata! ---")
         print(f"Tiles salvate in: {output_dir}")
         print(f"Tempo totale impiegato per il tiling: {elapsed_time:.2f} secondi")
@@ -263,7 +272,7 @@ def create_map_tiles_workflow(input_file, output_dir, zoom, processes):
         print("\n--- ERRORE durante la generazione delle tiles ---")
 
     # Pulizia finale
-    if os.path.exists(temp_vrt_file):
+    if temp_vrt_file and os.path.exists(temp_vrt_file):
         os.remove(temp_vrt_file)
         print(f"\nFile temporaneo '{temp_vrt_file}' rimosso.")
 
@@ -285,6 +294,16 @@ def main():
                        help=f'Livelli di zoom (default: {zoom_levels})')
     parser.add_argument('-p', '--processes', type=int, default=num_processes,
                        help=f'Numero di processi paralleli (default: {num_processes})')
+    parser.add_argument('--scheme', choices=['xyz', 'tms'], default='xyz',
+                       help='Numerazione tiles: xyz = Google Maps / OpenStreetMap / Leaflet / MapLibre (default), '
+                            'tms = Y invertita (OpenLayers TMS, Cesium, GeoServer)')
+    parser.add_argument('-f', '--format', choices=['png', 'webp', 'jpeg'], default='png',
+                       help='Formato delle tiles (default: png; webp/jpeg sono molto più leggere e veloci)')
+    parser.add_argument('-r', '--resampling', default='near',
+                       choices=['near', 'bilinear', 'cubic', 'cubicspline', 'lanczos', 'average'],
+                       help='Algoritmo di resampling (default: near, il più veloce)')
+    parser.add_argument('--resume', action='store_true',
+                       help='Riprende una generazione interrotta creando solo le tiles mancanti')
     parser.add_argument('--target-crs', type=str, default=None,
                        help='Verifica corrispondenza CRS atteso (es. EPSG:32633 o EPSG:3857, opzionale)')
 
@@ -318,7 +337,8 @@ def main():
     print(f"\nLe tiles verranno salvate in: {dynamic_output_folder}")
 
     # Esegui il workflow di creazione delle tiles
-    create_map_tiles_workflow(input_file, dynamic_output_folder, args.zoom, args.processes)
+    create_map_tiles_workflow(input_file, dynamic_output_folder, args.zoom, args.processes,
+                              args.scheme, args.format, args.resampling, args.resume)
 
 
 if __name__ == "__main__":

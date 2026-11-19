@@ -31,9 +31,11 @@ pip install -r requirements.txt
 ```
 
 > [!TIP]
-> Su **Windows**, il modo più semplice per disporre di GDAL e dei suoi strumenti CLI è utilizzare **Conda / Mamba**:
+> Su **Windows**, il modo più semplice per disporre di GDAL e dei suoi strumenti CLI è utilizzare **Conda / Mamba**.
+> Il file `environment.yml` crea l'ambiente dedicato `geotiff-tiling`:
 > ```bash
-> conda install -c conda-forge gdal rasterio flask
+> conda env create -f environment.yml
+> conda activate geotiff-tiling
 > ```
 > In alternativa è possibile utilizzare l'installer [OSGeo4W](https://trac.osgeo.org/osgeo4w/).
 
@@ -63,7 +65,11 @@ python main.py -d ./cartella_rilievo -o output_tiles -z 15-22
 | `-d, --directory` | Cartella con i file grezzi (`.tif`, `.tfw`, `.prj`) | *(mutuamente esclusivo con `-i`)* |
 | `-o, --output` | Cartella di destinazione delle tiles | `output_tiles` |
 | `-z, --zoom` | Intervallo dei livelli di zoom (es. `15-20`, `15-24`) | `15-25` |
-| `-p, --processes` | Numero di processi paralleli | `5` |
+| `-p, --processes` | Numero di processi paralleli | n. CPU |
+| `--scheme` | `xyz` = Google Maps, **OpenStreetMap**, Leaflet, MapLibre; `tms` = Y invertita (OpenLayers TMS, Cesium) | `xyz` |
+| `-f, --format` | Formato tiles: `png`, `webp`, `jpeg` (webp/jpeg più leggeri e veloci, senza trasparenza per jpeg) | `png` |
+| `-r, --resampling` | `near`, `bilinear`, `cubic`, `cubicspline`, `lanczos`, `average` | `near` |
+| `--resume` | Riprende una generazione interrotta (solo tiles mancanti) | off |
 | `--target-crs` | Codice CRS atteso per verifica (es. `EPSG:32633`) | `None` (rileva automaticamente) |
 
 ---
