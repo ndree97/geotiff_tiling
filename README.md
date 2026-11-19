@@ -43,6 +43,15 @@ pip install -r requirements.txt
 
 ## 🚀 Utilizzo
 
+### 0. Interfaccia grafica (Qt)
+```bash
+conda activate geotiff-tiling
+python gui.py
+```
+Seleziona sorgente, output, zoom, schema (`xyz`/`tms`), formato e resampling; l'avanzamento appare in tempo reale. La GUI lancia `main.py`, quindi i due sono sempre allineati.
+
+Il pannello a destra mostra su **OpenStreetMap** l'anteprima del GeoTIFF (overview a 2048 px) e, a fine generazione, le tiles prodotte; i livelli si accendono/spengono dal selettore in alto a destra. Serve la connessione internet per la mappa base. `preview.py` serve la pagina da un server HTTP locale perché i tile server di OSM rifiutano le richieste senza Referer (cioè da `file://`).
+
 ### 1. Modalità File Singolo (GeoTIFF)
 Usa questa modalità se disponi già di un raster GeoTIFF georeferenziato:
 

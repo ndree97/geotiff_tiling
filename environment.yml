@@ -6,3 +6,4 @@ dependencies:
   - gdal>=3.8
   - rasterio
   - flask
+  - pyside6
