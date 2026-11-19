@@ -48,9 +48,13 @@ pip install -r requirements.txt
 conda activate geotiff-tiling
 python gui.py
 ```
-Seleziona sorgente, output, zoom, schema (`xyz`/`tms`), formato e resampling; l'avanzamento appare in tempo reale. La GUI lancia `main.py`, quindi i due sono sempre allineati.
+1. **Sorgente**: trascina un GeoTIFF o una cartella (`.tif` + `.tfw` + `.prj`) sulla finestra, oppure usa *File…* / *Cartella…*. La GUI riconosce il tipo e mostra CRS, dimensione e risoluzione, e disegna subito l'anteprima su **OpenStreetMap**.
+2. **Tiles**: lo zoom massimo è calcolato dalla risoluzione del raster (*Auto*) con la stima del numero di tiles; scegli formato (PNG/WebP/JPEG) e compatibilità (XYZ per Google Maps/OSM/Leaflet, TMS per OpenLayers/Cesium).
+3. **Genera tiles**: barra di avanzamento e, a fine lavoro, le tiles compaiono nella mappa (livello *Tiles generate*). *Dettagli* mostra il log; *Opzioni avanzate* contiene processi, resampling e ripresa.
 
-Il pannello a destra mostra su **OpenStreetMap** l'anteprima del GeoTIFF (overview a 2048 px) e, a fine generazione, le tiles prodotte; i livelli si accendono/spengono dal selettore in alto a destra. Serve la connessione internet per la mappa base. `preview.py` serve la pagina da un server HTTP locale perché i tile server di OSM rifiutano le richieste senza Referer (cioè da `file://`).
+Se il raster **non è georeferenziato** (es. disegno scansionato) compare il pannello *Posizionamento approssimato*: clicca sulla mappa per scegliere il punto, poi regola scala e rotazione: l'anteprima si aggiorna da sola (il bianco del disegno diventa trasparente per confrontarlo con la mappa). Le impostazioni principali vengono ricordate tra le sessioni. La GUI lancia `main.py`, quindi i due sono sempre allineati.
+
+Il pannello della mappa richiede internet (mappa base OSM e Leaflet). `preview.py` serve la pagina da un server HTTP locale perché i tile server di OSM rifiutano le richieste senza Referer (cioè da `file://`).
 
 ### 1. Modalità File Singolo (GeoTIFF)
 Usa questa modalità se disponi già di un raster GeoTIFF georeferenziato:

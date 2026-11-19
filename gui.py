@@ -1,129 +1,317 @@
+import glob
 import os
 import sys
 import threading
-from PySide6.QtCore import QProcess, QProcessEnvironment, Qt, QUrl, Signal
+import time
+
+from osgeo import gdal
+from PySide6.QtCore import QProcess, QProcessEnvironment, QSettings, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QTextCursor
-from PySide6.QtWebEngineCore import QWebEngineSettings
+from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineSettings
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QFileDialog, QFormLayout, QHBoxLayout,
-    QDoubleSpinBox, QLineEdit, QPlainTextEdit, QProgressBar, QPushButton, QRadioButton,
-    QSpinBox, QSplitter, QVBoxLayout, QWidget,
+    QApplication, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout, QFrame, QGroupBox, QHBoxLayout,
+    QLabel, QLineEdit, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea, QSlider, QSpinBox,
+    QSplitter, QVBoxLayout, QWidget,
 )
 
 import georef
-from preview import Preview
+from preview import Preview, native_zoom, pixel_size_m, tile_count
+
+gdal.UseExceptions()
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ENV = os.path.dirname(sys.executable)  # radice dell'ambiente conda
+IDENTITY = (0.0, 1.0, 0.0, 0.0, 0.0, 1.0)  # geotransform di un raster non georeferenziato
+
+FORMATS = [("PNG  ·  qualità massima, con trasparenza", "png"),
+           ("WebP  ·  leggero, con trasparenza", "webp"),
+           ("JPEG  ·  il più piccolo, senza trasparenza", "jpeg")]
+SCHEMES = [("Google Maps / OpenStreetMap / Leaflet  (XYZ)", "xyz"),
+           ("TMS  ·  OpenLayers TMS, Cesium, GeoServer", "tms")]
+RESAMPLINGS = ["near", "bilinear", "cubic", "cubicspline", "lanczos", "average"]
+
+PLACEHOLDER = """<body style="font-family:Segoe UI,sans-serif;margin:0;height:100vh;display:grid;place-items:center;color:#888">
+<div style="text-align:center"><h2 style="font-weight:500">Trascina qui un GeoTIFF o una cartella</h2>
+<p>oppure usa i pulsanti <b>File…</b> / <b>Cartella…</b></p></div></body>"""
+
+
+class Page(QWebEnginePage):
+    """Impedisce che un file trascinato sulla mappa venga aperto: lo usa come nuova sorgente."""
+
+    def __init__(self, parent, on_file):
+        super().__init__(parent)
+        self.on_file = on_file
+
+    def acceptNavigationRequest(self, url, nav_type, is_main_frame):
+        if url.isLocalFile():
+            self.on_file(url.toLocalFile())
+            return False
+        return True
+
+
+def find_tif(path):
+    """File .tif da ispezionare: il file stesso, o il primo .tif (non *_tile.tif) di una cartella."""
+    if os.path.isfile(path):
+        return path
+    tifs = [f for f in sorted(glob.glob(os.path.join(path, "*.tif*"))) if not f.lower().endswith("_tile.tif")]
+    return tifs[0] if tifs else None
+
+
+def inspect(path):
+    """Legge le proprietà del raster. Solleva ValueError con un messaggio comprensibile."""
+    is_dir = os.path.isdir(path)
+    if is_dir:
+        exts = {os.path.splitext(f)[1].lower() for f in os.listdir(path)}
+        missing = [e for e in (".tif", ".tfw", ".prj") if e not in exts]
+        if missing:
+            raise ValueError("La cartella deve contenere .tif, .tfw e .prj: manca " + ", ".join(missing))
+    elif not os.path.isfile(path):
+        raise ValueError("File o cartella non trovati")
+    tif = find_tif(path)
+    if not tif:
+        raise ValueError("Nessun file .tif trovato")
+    try:
+        d = gdal.Open(tif)
+    except RuntimeError as e:
+        raise ValueError(f"File non leggibile: {e}")
+    ok = not (d.GetGeoTransform() == IDENTITY and not d.GetGCPCount())
+    info = dict(tif=tif, is_dir=is_dir, w=d.RasterXSize, h=d.RasterYSize, georef=ok, dpi=georef.read_dpi(d))
+    if ok:
+        srs = d.GetSpatialRef()
+        code = srs.GetAuthorityCode(None) if srs is not None else None
+        info["crs"] = f"EPSG:{code}" if code else "CRS personalizzato"
+        info["res_m"] = pixel_size_m(d)
+    return info
 
 
 class Window(QWidget):
-    preview_ready = Signal(str)  # URL, oppure messaggio d'errore con prefisso '!'
+    inspected = Signal(int, object, str)       # generazione, info, errore
+    preview_ready = Signal(int, str, str)      # generazione, URL, errore
+    picked = Signal(float, float)              # punto scelto con un clic sulla mappa
 
     def __init__(self):
         super().__init__()
         self.setWindowTitle("GeoTIFF Tiling")
-        self.resize(1300, 720)
+        self.resize(1320, 800)
+        self.setAcceptDrops(True)
+        self.settings = QSettings("geotiff_tiling", "gui")
+        self.preview = Preview(on_pick=self.picked.emit)
         self.proc = None
-        self.preview = Preview()
+        self.info = None           # risultato di inspect() sulla sorgente corrente
+        self.gen = 0               # scarta i risultati di lavori superati
+        self.auto_zoom_pending = False
+        self.keep_view = False
+        self.pass_no = 0           # gdal2tiles stampa 0..100 una volta per fase
+        self.cancelled = False
+        self.showing_tiles = False
 
-        self.file_mode = QRadioButton("File GeoTIFF")
-        self.dir_mode = QRadioButton("Cartella (.tif + .tfw + .prj)")
-        self.file_mode.setChecked(True)
-        self.input = QLineEdit()
-        self.output = QLineEdit(os.path.join(HERE, "output_tiles"))
-        self.zmin = QSpinBox(); self.zmin.setRange(0, 30); self.zmin.setValue(15)
-        self.zmax = QSpinBox(); self.zmax.setRange(0, 30); self.zmax.setValue(20)
-        self.procs = QSpinBox(); self.procs.setRange(1, 64); self.procs.setValue(os.cpu_count() or 4)
-        self.scheme = QComboBox(); self.scheme.addItems(["xyz", "tms"])
-        self.scheme.setToolTip("xyz: Google Maps, OpenStreetMap, Leaflet, MapLibre\ntms: Y invertita (OpenLayers TMS, Cesium)")
-        self.fmt = QComboBox(); self.fmt.addItems(["png", "webp", "jpeg"])
-        self.resampling = QComboBox(); self.resampling.addItems(["near", "bilinear", "cubic", "cubicspline", "lanczos", "average"])
-        self.resume = QCheckBox("Riprendi (solo tiles mancanti)")
-
-        # Posizionamento approssimato di raster non georeferenziati (disegni scansionati)
-        self.place_on = QCheckBox("Posiziona raster non georeferenziato (approssimato)")
-        self.place_ll = QLineEdit(); self.place_ll.setPlaceholderText("LAT, LON   es. 40.84022778, 14.09117778")
-        self.scale = QDoubleSpinBox(); self.scale.setRange(1, 1_000_000); self.scale.setDecimals(0); self.scale.setValue(100)
-        self.scale.setPrefix("1:")
-        self.rot = QDoubleSpinBox(); self.rot.setRange(-360, 360); self.rot.setDecimals(1); self.rot.setSuffix(" ° orari dal nord")
-        self.crop = QLineEdit(); self.crop.setPlaceholderText("X Y W H in pixel (vuoto = tutta l immagine)")
-        self.anchor = QLineEdit(); self.anchor.setPlaceholderText("X Y del pixel sul punto (vuoto = centro)")
-        self.place_box = QWidget(); pform = QFormLayout(self.place_box); pform.setContentsMargins(0, 0, 0, 0)
-        for label, w in (("Punto", self.place_ll), ("Scala disegno", self.scale), ("Rotazione", self.rot),
-                         ("Ritaglio", self.crop), ("Ancora", self.anchor)):
-            pform.addRow(label, w)
-        self.place_box.setEnabled(False)
-        self.place_on.toggled.connect(self.place_box.setEnabled)
-        self.dir_mode.toggled.connect(lambda on: (self.place_on.setChecked(False), self.place_on.setEnabled(not on)))
-
-        form = QFormLayout()
-        mode = QHBoxLayout(); mode.addWidget(self.file_mode); mode.addWidget(self.dir_mode)
-        form.addRow("Sorgente", mode)
-        form.addRow("Input", self._with_browse(self.input, self._pick_input))
-        form.addRow("Output", self._with_browse(self.output, self._pick_output))
-        zoom = QHBoxLayout(); zoom.addWidget(self.zmin); zoom.addWidget(self.zmax); zoom.addStretch()
-        form.addRow("Zoom min / max", zoom)
-        form.addRow("Processi", self.procs)
-        form.addRow("Schema", self.scheme)
-        form.addRow("Formato", self.fmt)
-        form.addRow("Resampling", self.resampling)
-        form.addRow("", self.resume)
-        form.addRow(self.place_on)
-        form.addRow(self.place_box)
-
-        self.start = QPushButton("Avvia"); self.start.clicked.connect(self.run)
-        self.cancel = QPushButton("Annulla"); self.cancel.setEnabled(False); self.cancel.clicked.connect(self.stop)
-        self.open_out = QPushButton("Apri cartella output"); self.open_out.clicked.connect(self.open_output)
-        self.show_prev = QPushButton("Anteprima"); self.show_prev.clicked.connect(self.refresh_preview)
-        buttons = QHBoxLayout()
-        for b in (self.start, self.cancel, self.show_prev, self.open_out):
-            buttons.addWidget(b)
-
-        self.bar = QProgressBar(); self.bar.setRange(0, 100); self.bar.setValue(0)
-        self.log = QPlainTextEdit(); self.log.setReadOnly(True)
-
-        left = QWidget()
-        layout = QVBoxLayout(left)
-        layout.addLayout(form); layout.addLayout(buttons); layout.addWidget(self.bar); layout.addWidget(self.log)
-
+        left = self._build_left()
         self.web = QWebEngineView()
+        self.web.setPage(Page(self.web, self.set_source))
         self.web.settings().setAttribute(QWebEngineSettings.LocalContentCanAccessRemoteUrls, True)
-        self.web.setHtml("<body style='font-family:sans-serif;color:#666'><p>Premi <b>Anteprima</b> per vedere "
-                         "il GeoTIFF e le tiles generate su OpenStreetMap.</p></body>")
-        self.preview_ready.connect(self.on_preview_ready)
+        self.web.setHtml(PLACEHOLDER)
 
+        scroll = QScrollArea(); scroll.setWidget(left); scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame); scroll.setMinimumWidth(470)
         split = QSplitter(Qt.Horizontal)
-        split.addWidget(left); split.addWidget(self.web)
-        split.setStretchFactor(0, 0); split.setStretchFactor(1, 1); split.setSizes([480, 820])
+        split.addWidget(scroll); split.addWidget(self.web)
+        split.setStretchFactor(1, 1); split.setSizes([480, 840])
         outer = QHBoxLayout(self); outer.setContentsMargins(0, 0, 0, 0); outer.addWidget(split)
 
-    def _with_browse(self, edit, slot):
-        row = QHBoxLayout(); row.setContentsMargins(0, 0, 0, 0)
-        btn = QPushButton("Sfoglia…"); btn.clicked.connect(slot)
-        row.addWidget(edit); row.addWidget(btn)
-        w = QWidget(); w.setLayout(row)
+        self.inspected.connect(self.on_inspected)
+        self.preview_ready.connect(self.on_preview_ready)
+        self.picked.connect(self.on_picked)
+        self.debounce = QTimer(self, singleShot=True, interval=500)  # anteprima live mentre si regolano i campi
+        self.debounce.timeout.connect(lambda: self.refresh_preview(keep_view=True))
+        self._load_settings()
+
+    # ---------------------------------------------------------------- interfaccia
+    def _build_left(self):
+        w = QWidget()
+        lay = QVBoxLayout(w)
+
+        # 1 · Sorgente
+        self.source = QLineEdit(); self.source.setPlaceholderText("Trascina qui un GeoTIFF o una cartella (.tif + .tfw + .prj)")
+        self.source.editingFinished.connect(lambda: self.set_source(self.source.text()))
+        b_file = QPushButton("File…"); b_file.clicked.connect(self._pick_file)
+        b_dir = QPushButton("Cartella…"); b_dir.clicked.connect(self._pick_dir)
+        row = QHBoxLayout(); row.addWidget(self.source, 1); row.addWidget(b_file); row.addWidget(b_dir)
+        self.summary = QLabel(); self.summary.setWordWrap(True); self.summary.setTextFormat(Qt.RichText)
+        g1 = QGroupBox("Sorgente"); l1 = QVBoxLayout(g1); l1.addLayout(row); l1.addWidget(self.summary)
+        lay.addWidget(g1)
+
+        # 2 · Posizionamento (solo per raster non georeferenziati)
+        self.point = QLineEdit(); self.point.setPlaceholderText("LAT, LON  —  oppure clicca sulla mappa")
+        self.scale = QDoubleSpinBox(); self.scale.setRange(1, 1_000_000); self.scale.setDecimals(0)
+        self.scale.setValue(100); self.scale.setPrefix("1:")
+        self.rot = QDoubleSpinBox(); self.rot.setRange(-360, 360); self.rot.setDecimals(1); self.rot.setSuffix(" °")
+        self.rot_slider = QSlider(Qt.Horizontal); self.rot_slider.setRange(-180, 180)
+        self.rot_slider.valueChanged.connect(self.rot.setValue)
+        self.rot.valueChanged.connect(lambda v: self.rot_slider.setValue(int(v)) if -180 <= v <= 180 else None)
+        rrow = QHBoxLayout(); rrow.addWidget(self.rot); rrow.addWidget(self.rot_slider, 1)
+        self.dpi = QSpinBox(); self.dpi.setRange(0, 2400); self.dpi.setSpecialValueText("dal file")
+        self.crop = QLineEdit(); self.crop.setPlaceholderText("X Y larghezza altezza in pixel (vuoto = tutta l immagine)")
+        self.anchor = QLineEdit(); self.anchor.setPlaceholderText("X Y del pixel sul punto (vuoto = centro)")
+        self.place_box = QGroupBox("Posizionamento approssimato")
+        pf = QFormLayout(self.place_box)
+        hint = QLabel("Il raster non ha coordinate: indica dove si trova. Il risultato è una stima, "
+                      "non una vera georeferenziazione.")
+        hint.setWordWrap(True)
+        pf.addRow(hint)
+        for label, widget in (("Punto", self.point), ("Scala disegno", self.scale), ("Rotazione", rrow),
+                              ("DPI scansione", self.dpi), ("Ritaglio", self.crop), ("Ancora", self.anchor)):
+            pf.addRow(label, widget)
+        for sig in (self.point.textChanged, self.scale.valueChanged, self.rot.valueChanged,
+                    self.dpi.valueChanged, self.crop.textChanged, self.anchor.textChanged):
+            sig.connect(lambda *_: self.debounce.start())
+        self.place_box.setVisible(False)
+        lay.addWidget(self.place_box)
+
+        # 3 · Tiles
+        self.zmin = QSpinBox(); self.zmin.setRange(0, 30)
+        self.zmax = QSpinBox(); self.zmax.setRange(0, 30)
+        auto = QPushButton("Auto"); auto.setToolTip("Zoom massimo = risoluzione nativa del raster"); auto.clicked.connect(self.apply_auto_zoom)
+        zrow = QHBoxLayout()
+        for x in (QLabel("da"), self.zmin, QLabel("a"), self.zmax, auto):
+            zrow.addWidget(x)
+        zrow.addStretch()
+        for sp in (self.zmin, self.zmax):
+            sp.valueChanged.connect(self.update_estimate)
+        self.estimate = QLabel(); self.estimate.setWordWrap(True)
+        self.fmt = QComboBox()
+        for label, value in FORMATS:
+            self.fmt.addItem(label, value)
+        self.scheme = QComboBox()
+        for label, value in SCHEMES:
+            self.scheme.addItem(label, value)
+        self.output = QLineEdit(os.path.join(HERE, "output_tiles"))
+        b_out = QPushButton("…"); b_out.setFixedWidth(34); b_out.clicked.connect(self._pick_output)
+        orow = QHBoxLayout(); orow.addWidget(self.output, 1); orow.addWidget(b_out)
+        g3 = QGroupBox("Tiles"); f3 = QFormLayout(g3)
+        f3.addRow("Livelli di zoom", zrow)
+        f3.addRow("", self.estimate)
+        f3.addRow("Formato", self.fmt)
+        f3.addRow("Compatibile con", self.scheme)
+        f3.addRow("Cartella output", orow)
+        lay.addWidget(g3)
+
+        # Opzioni avanzate (chiuse di default)
+        self.procs = QSpinBox(); self.procs.setRange(1, 64); self.procs.setValue(os.cpu_count() or 4)
+        self.resampling = QComboBox(); self.resampling.addItems(RESAMPLINGS)
+        self.resampling.setToolTip("near: il più veloce. bilinear/cubic/lanczos: più morbido, più lento")
+        self.resume = QPushButton("Riprendi un lavoro interrotto (solo tiles mancanti)"); self.resume.setCheckable(True)
+        adv = QGroupBox("Opzioni avanzate"); adv.setCheckable(True); adv.setChecked(False)
+        inner = QWidget(); fa = QFormLayout(inner); fa.setContentsMargins(0, 0, 0, 0)
+        fa.addRow("Processi", self.procs); fa.addRow("Resampling", self.resampling); fa.addRow(self.resume)
+        va = QVBoxLayout(adv); va.addWidget(inner); inner.setVisible(False)
+        adv.toggled.connect(inner.setVisible)
+        lay.addWidget(adv)
+
+        # Azioni
+        self.start = QPushButton("Genera tiles"); self.start.setObjectName("primary"); self.start.setMinimumHeight(38)
+        self.start.setStyleSheet("QPushButton#primary{background:#2d7ff9;color:white;font-weight:600;border:0;border-radius:4px}"
+                                 "QPushButton#primary:disabled{background:#7a8aa3;color:#ddd}")
+        self.start.clicked.connect(self.run); self.start.setEnabled(False)
+        self.cancel = QPushButton("Annulla"); self.cancel.setMinimumHeight(38); self.cancel.setVisible(False)
+        self.cancel.clicked.connect(self.stop)
+        arow = QHBoxLayout(); arow.addWidget(self.start, 1); arow.addWidget(self.cancel)
+        lay.addLayout(arow)
+        self.bar = QProgressBar(); self.bar.setRange(0, 100); self.bar.setVisible(False)
+        lay.addWidget(self.bar)
+        self.status = QLabel(); self.status.setWordWrap(True)
+        lay.addWidget(self.status)
+
+        b_open = QPushButton("Apri cartella output"); b_open.clicked.connect(self.open_output)
+        b_browser = QPushButton("Apri mappa nel browser"); b_browser.clicked.connect(self.open_browser)
+        b_log = QPushButton("Dettagli"); b_log.setCheckable(True)
+        brow = QHBoxLayout()
+        for b in (b_open, b_browser, b_log):
+            brow.addWidget(b)
+        lay.addLayout(brow)
+        self.log = QPlainTextEdit(); self.log.setReadOnly(True); self.log.setVisible(False); self.log.setMinimumHeight(160)
+        b_log.toggled.connect(self.log.setVisible)
+        self.b_log = b_log
+        lay.addWidget(self.log)
+        lay.addStretch()
         return w
 
-    def _pick_input(self):
-        if self.dir_mode.isChecked():
-            path = QFileDialog.getExistingDirectory(self, "Cartella sorgente")
-        else:
-            path, _ = QFileDialog.getOpenFileName(self, "GeoTIFF", "", "GeoTIFF (*.tif *.tiff)")
+    def set_status(self, text, error=False):
+        self.status.setStyleSheet("color:#e5484d" if error else "")
+        self.status.setText(text)
+
+    # ---------------------------------------------------------------- sorgente
+    def dragEnterEvent(self, e):
+        if e.mimeData().hasUrls():
+            e.acceptProposedAction()
+
+    def dropEvent(self, e):
+        self.set_source(e.mimeData().urls()[0].toLocalFile())
+
+    def _start_dir(self):
+        return self.settings.value("last_dir", HERE)
+
+    def _pick_file(self):
+        path, _ = QFileDialog.getOpenFileName(self, "GeoTIFF", self._start_dir(), "GeoTIFF (*.tif *.tiff)")
         if path:
-            self.input.setText(os.path.normpath(path))
+            self.set_source(path)
+
+    def _pick_dir(self):
+        path = QFileDialog.getExistingDirectory(self, "Cartella con .tif + .tfw + .prj", self._start_dir())
+        if path:
+            self.set_source(path)
 
     def _pick_output(self):
-        path = QFileDialog.getExistingDirectory(self, "Cartella output")
+        path = QFileDialog.getExistingDirectory(self, "Cartella output", self.output.text())
         if path:
             self.output.setText(os.path.normpath(path))
 
-    def _place_args(self):
-        """None se il posizionamento è spento, altrimenti i parametri per georef.place_raster. ValueError se non validi."""
-        if not self.place_on.isChecked():
-            return None
+    def set_source(self, path):
+        path = os.path.normpath(path.strip().strip('"')) if path.strip() else ""
+        self.source.setText(path)
+        self.gen += 1
+        gen = self.gen
+        self.info = None
+        self.start.setEnabled(False)
+        self.place_box.setVisible(False)
+        if not path:
+            self.summary.setText(""); return
+        self.settings.setValue("last_dir", os.path.dirname(path))
+        self.summary.setText("Lettura del raster…")
 
+        def work():
+            try:
+                self.inspected.emit(gen, inspect(path), "")
+            except Exception as e:
+                self.inspected.emit(gen, None, str(e))
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_inspected(self, gen, info, err):
+        if gen != self.gen:
+            return
+        if err:
+            self.summary.setText(f"<span style='color:#e5484d'>{err}</span>")
+            return
+        self.info = info
+        size = f"{info['w']:,} × {info['h']:,} px".replace(",", ".")
+        kind = "cartella con .tfw/.prj" if info["is_dir"] else "file"
+        if info["georef"]:
+            res = info["res_m"]
+            res_txt = f"{res * 100:.1f} cm/px" if res < 1 else f"{res:.1f} m/px"
+            self.summary.setText(f"<b>✔ Georeferenziato</b> · {info['crs']} · {size} · {res_txt}<br><small>{kind}</small>")
+        else:
+            self.summary.setText(f"<b>⚠ Non georeferenziato</b> · {size}<br><small>Indica sotto dove si trova: "
+                                 f"la GUI lo posiziona in modo approssimato.</small>")
+            self.dpi.setValue(0)
+            self.resampling.setCurrentText("average")  # con "near" le linee sottili dei disegni spariscono rimpicciolendo
+        self.place_box.setVisible(not info["georef"])
+        self.start.setEnabled(True)
+        self.auto_zoom_pending = True
+        self.refresh_preview()
+
+    # ---------------------------------------------------------------- anteprima
+    def _place_args(self):
+        """None se manca ancora il punto. ValueError se i valori non sono validi."""
         def nums(text, n, what):
             try:
                 v = [float(x) for x in text.replace(",", " ").split()]
@@ -133,33 +321,120 @@ class Window(QWidget):
                 raise ValueError(f"{what}: servono {n} numeri")
             return v
 
-        lat, lon = nums(self.place_ll.text(), 2, "Punto (LAT, LON)")
-        crop = self.crop.text().strip()
-        anchor = self.anchor.text().strip()
+        if not self.point.text().strip():
+            return None
+        lat, lon = nums(self.point.text(), 2, "Punto (LAT, LON)")
+        crop, anchor = self.crop.text().strip(), self.anchor.text().strip()
         return dict(lat=lat, lon=lon, scale=self.scale.value(), rotation=self.rot.value(),
+                    dpi=self.dpi.value() or None,
                     crop=tuple(int(x) for x in nums(crop, 4, "Ritaglio")) if crop else None,
                     anchor_px=tuple(nums(anchor, 2, "Ancora")) if anchor else None)
 
-    def run(self):
-        if not self.input.text().strip():
-            self.log.appendPlainText("Seleziona un input.")
+    def _tiles_dir(self):
+        src = self.source.text()
+        base = f"{os.path.basename(src)}_tile" if self.info["is_dir"] else os.path.splitext(os.path.basename(src))[0]
+        return os.path.join(self.output.text().strip(), f"{base}_{self.zmin.value()}{self.zmax.value()}")
+
+    def refresh_preview(self, show_tiles=False, keep_view=False):
+        if not self.info:
             return
         try:
-            place = self._place_args()
+            place = None if self.info["georef"] else self._place_args()
         except ValueError as e:
-            self.log.appendPlainText(str(e))
+            self.set_status(str(e), error=True)
             return
+        self.gen += 1
+        gen, info = self.gen, self.info
+        self.keep_view = keep_view
+        self.showing_tiles = show_tiles
+        needs_point = not info["georef"] and place is None
+        if not show_tiles:
+            self.set_status("Clicca sulla mappa per scegliere il punto." if needs_point else "Preparo l anteprima…")
+        tiles = self._tiles_dir() if show_tiles else None
+        kw = dict(scheme=self.scheme.currentData(), ext=self.fmt.currentData().replace("jpeg", "jpg"),
+                  zmin=self.zmin.value(), zmax=self.zmax.value(), multiply=not info["georef"], pick=not info["georef"])
+
+        def work():  # l overview di un raster grande richiede secondi: fuori dal thread della GUI
+            try:
+                if needs_point:
+                    url = self.preview.build(None, **kw)
+                else:
+                    src = georef.place_raster(info["tif"], **place) if place else info["tif"]
+                    url = self.preview.build(src, tiles, **kw)
+                self.preview_ready.emit(gen, url, "")
+            except Exception as e:
+                self.preview_ready.emit(gen, "", str(e))
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_preview_ready(self, gen, url, err):
+        if gen != self.gen:
+            return
+        if err:
+            self.auto_zoom_pending = False  # imposta lo zoom a mano
+            self.set_status(f"Anteprima non disponibile: {err}", error=True)
+            return
+        view = self.preview.view
+        frag = f"#{view[2]}/{view[0]}/{view[1]}" if self.keep_view and view else ""
+        self.web.setUrl(QUrl(f"{url}?v={time.time_ns()}{frag}"))  # il parametro forza il ricaricamento
+        if self.auto_zoom_pending and self.preview.info:
+            self.apply_auto_zoom()
+        self.update_estimate()
+        if self.info and not self.info["georef"] and not self.preview.info:
+            return
+        if not self.showing_tiles:
+            self.set_status("Anteprima pronta. Puoi generare le tiles.")
+
+    def on_picked(self, lat, lon):
+        self.point.setText(f"{lat:.8f}, {lon:.8f}")  # il cambio del testo aggiorna l anteprima
+
+    # ---------------------------------------------------------------- zoom e stima
+    def apply_auto_zoom(self):
+        i = self.preview.info
+        if not i:
+            return
+        self.auto_zoom_pending = False
+        zmax = max(0, min(24, round(native_zoom(i["res_m"], i["lat"]))))
+        self.zmax.setValue(zmax); self.zmin.setValue(max(0, zmax - 4))
+
+    def update_estimate(self):
+        i = self.preview.info
+        if not i:
+            self.estimate.setText(""); return
+        zmin, zmax = self.zmin.value(), self.zmax.value()
+        if zmin > zmax:
+            self.estimate.setText("<span style='color:#e5484d'>Lo zoom minimo supera il massimo</span>"); return
+        n = tile_count(i["bounds"], zmin, zmax)
+        native = round(native_zoom(i["res_m"], i["lat"]))
+        text = f"≈ {n:,} tiles".replace(",", ".")
+        if zmax > native:
+            text += f" · sopra lo zoom {native} l immagine è solo ingrandita"
+        if n > 200_000:
+            text = f"<span style='color:#e5484d'>{text} · molto grande: riduci lo zoom massimo</span>"
+        self.estimate.setText(text)
+
+    # ---------------------------------------------------------------- esecuzione
+    def run(self):
+        if not self.info:
+            return
+        try:
+            place = None if self.info["georef"] else self._place_args()
+        except ValueError as e:
+            self.set_status(str(e), error=True); return
+        if not self.info["georef"] and place is None:
+            self.set_status("Imposta il punto (LAT, LON) o cliccalo sulla mappa.", error=True); return
+        if self.auto_zoom_pending:
+            self.set_status("Sto ancora leggendo il raster per calcolare lo zoom: riprova tra un momento.", error=True); return
         if self.zmin.value() > self.zmax.value():
-            self.log.appendPlainText("Zoom min deve essere <= zoom max.")
-            return
+            self.set_status("Lo zoom minimo supera il massimo.", error=True); return
+
         args = [
             "-u", os.path.join(HERE, "main.py"),
-            "-d" if self.dir_mode.isChecked() else "-i", self.input.text().strip(),
+            "-d" if self.info["is_dir"] else "-i", self.source.text().strip(),
             "-o", self.output.text().strip(),
             "-z", f"{self.zmin.value()}-{self.zmax.value()}",
             "-p", str(self.procs.value()),
-            "--scheme", self.scheme.currentText(),
-            "-f", self.fmt.currentText(),
+            "--scheme", self.scheme.currentData(),
+            "-f", self.fmt.currentData(),
             "-r", self.resampling.currentText(),
         ]
         if self.resume.isChecked():
@@ -167,6 +442,8 @@ class Window(QWidget):
         if place:
             args += ["--place", str(place["lat"]), str(place["lon"]), "--scale", str(place["scale"]),
                      "--rotation", str(place["rotation"])]
+            if place["dpi"]:
+                args += ["--dpi", str(place["dpi"])]
             if place["crop"]:
                 args += ["--crop", *map(str, place["crop"])]
             if place["anchor_px"]:
@@ -180,7 +457,7 @@ class Window(QWidget):
         env.insert("PROJ_DATA", os.path.join(ENV, "Library", "share", "proj"))
         env.insert("PYTHONIOENCODING", "utf-8")
 
-        self.log.clear(); self.bar.setValue(0)
+        self.log.clear(); self.bar.setValue(0); self.pass_no = 0; self.cancelled = False
         self.proc = QProcess(self)
         self.proc.setProcessEnvironment(env)
         self.proc.setWorkingDirectory(HERE)
@@ -188,76 +465,75 @@ class Window(QWidget):
         self.proc.readyReadStandardOutput.connect(self.on_output)
         self.proc.finished.connect(self.on_finished)
         self.log.appendPlainText(f"> python {' '.join(args)}\n")
-        self.start.setEnabled(False); self.cancel.setEnabled(True)
+        self._set_running(True)
+        self.set_status("Generazione in corso…")
         self.proc.start(sys.executable, args)
+
+    def _set_running(self, running):
+        for w in (self.source, self.point, self.scale, self.rot, self.rot_slider, self.dpi, self.crop, self.anchor,
+                  self.zmin, self.zmax, self.fmt, self.scheme, self.output, self.procs, self.resampling, self.resume):
+            w.setEnabled(not running)
+        self.start.setVisible(not running); self.cancel.setVisible(running); self.bar.setVisible(running)
 
     def on_output(self):
         text = bytes(self.proc.readAllStandardOutput()).decode("utf-8", errors="replace")
-        # gdal2tiles stampa "0...10...20...100 - done."; l'ultimo numero è l'avanzamento
+        # gdal2tiles stampa "0...10...100 - done." una volta per fase: tiles di base (~80%) e piramide (~20%)
         for token in text.replace("\r", "\n").replace(".", " ").split():
             if token.isdigit() and int(token) <= 100:
-                self.bar.setValue(int(token))
+                p = int(token)
+                self.bar.setValue(int(0.8 * p) if self.pass_no == 0 else int(80 + 0.2 * p))
+            elif token == "done":
+                self.pass_no += 1
         self.log.moveCursor(QTextCursor.End)
         self.log.insertPlainText(text)
         self.log.moveCursor(QTextCursor.End)
 
     def on_finished(self, code, _status):
-        ok = code == 0
-        if ok:
+        self._set_running(False)
+        self.settings.setValue("output", self.output.text())
+        if self.cancelled:
+            return
+        if code == 0:
             self.bar.setValue(100)
-            self.refresh_preview()
-        self.log.appendPlainText("\nCompletato." if ok else f"\nTerminato con errore (codice {code}).")
-        self.start.setEnabled(True); self.cancel.setEnabled(False)
-
-    def _tif_and_tiles(self):
-        """Stessi percorsi che calcola main.py: (tif sorgente, cartella tiles)."""
-        src = self.input.text().strip()
-        zoom = f"{self.zmin.value()}{self.zmax.value()}"
-        if self.dir_mode.isChecked():
-            name = os.path.basename(os.path.normpath(src))
-            tif = os.path.join(src, f"{name}_tile.tif")  # creato da main.py alla prima esecuzione
+            self.set_status("Completato. Le tiles sono visibili nella mappa (livello «Tiles generate»).")
+            self.refresh_preview(show_tiles=True, keep_view=True)
         else:
-            tif = src
-        base = os.path.splitext(os.path.basename(tif))[0]
-        return tif, os.path.join(self.output.text().strip(), f"{base}_{zoom}")
-
-    def refresh_preview(self):
-        try:
-            place = self._place_args()
-        except ValueError as e:
-            self.log.appendPlainText(str(e))
-            return
-        tif, tiles = self._tif_and_tiles()
-        if not os.path.isfile(tif):
-            self.log.appendPlainText(f"Anteprima: file non trovato ({tif}). In modalità cartella esiste dopo la prima generazione.")
-            return
-        self.show_prev.setEnabled(False)
-        self.log.appendPlainText("Anteprima: preparo l'overview del GeoTIFF…")
-        args = dict(scheme=self.scheme.currentText(), ext=self.fmt.currentText().replace("jpeg", "jpg"),
-                    zmin=self.zmin.value(), zmax=self.zmax.value(), multiply=bool(place))
-
-        def work():  # l'overview di un raster grande può richiedere secondi: fuori dal thread GUI
-            try:
-                src = georef.place_raster(tif, **place) if place else tif
-                self.preview_ready.emit(self.preview.build(src, tiles, **args))
-            except Exception as e:
-                self.preview_ready.emit(f"!{e}")
-        threading.Thread(target=work, daemon=True).start()
-
-    def on_preview_ready(self, msg):
-        self.show_prev.setEnabled(True)
-        if msg.startswith("!"):
-            self.log.appendPlainText(f"Anteprima fallita: {msg[1:]}")
-        else:
-            self.web.setUrl(QUrl(msg))
+            self.set_status(f"Terminato con errore (codice {code}). Apri «Dettagli» per il log.", error=True)
+            self.b_log.setChecked(True)
 
     def stop(self):
         if self.proc:
-            self.proc.kill()  # gdal2tiles ha processi figli: kill() ferma il padre, --resume riprende da lì
+            self.cancelled = True
+            self.proc.kill()  # gdal2tiles ha processi figli: kill() ferma il padre, «Riprendi» completa da lì
+            self.set_status("Annullato. Con «Riprendi» (opzioni avanzate) puoi completare il lavoro.")
 
     def open_output(self):
         os.makedirs(self.output.text(), exist_ok=True)
         QDesktopServices.openUrl(QUrl.fromLocalFile(self.output.text()))
+
+    def open_browser(self):
+        if self.web.url().scheme() == "http":
+            QDesktopServices.openUrl(self.web.url())
+
+    # ---------------------------------------------------------------- impostazioni
+    def _load_settings(self):
+        s = self.settings
+        self.output.setText(s.value("output", self.output.text()))
+        for combo, key in ((self.fmt, "fmt"), (self.scheme, "scheme")):
+            i = combo.findData(s.value(key, ""))
+            if i >= 0:
+                combo.setCurrentIndex(i)
+        self.resampling.setCurrentText(s.value("resampling", "near"))
+        self.procs.setValue(int(s.value("procs", self.procs.value())))
+
+    def closeEvent(self, e):
+        s = self.settings
+        s.setValue("output", self.output.text()); s.setValue("fmt", self.fmt.currentData())
+        s.setValue("scheme", self.scheme.currentData()); s.setValue("resampling", self.resampling.currentText())
+        s.setValue("procs", self.procs.value())
+        if self.proc and self.proc.state() != QProcess.NotRunning:
+            self.proc.kill()
+        super().closeEvent(e)
 
 
 if __name__ == "__main__":
