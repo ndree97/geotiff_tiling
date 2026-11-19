@@ -48,11 +48,18 @@ pip install -r requirements.txt
 conda activate geotiff-tiling
 python gui.py
 ```
-1. **Sorgente**: trascina un GeoTIFF o una cartella (`.tif` + `.tfw` + `.prj`) sulla finestra, oppure usa *File…* / *Cartella…*. La GUI riconosce il tipo e mostra CRS, dimensione e risoluzione, e disegna subito l'anteprima su **OpenStreetMap**.
+1. **Sorgente**, due modi:
+   - **Scarica online** (predefinito): cerca un luogo o inserisci `LAT, LON`, sposta/ingrandisci la mappa sull'area che ti interessa e premi *Scarica l'area visibile*. Il GeoTIFF viene salvato in `downloads/` e usato subito per il tiling. Fonti gratuite, senza chiavi: **Ortofoto Italia 2012 AGEA** (50 cm, solo Italia, servizio WMS del Geoportale Nazionale) e **Sentinel-2** (10 m, tutto il mondo, ultima scena con meno del 15% di nuvole). Area massima: circa 36 milioni di pixel.
+   - **File personalizzato** (opzionale): trascina un GeoTIFF o una cartella (`.tif` + `.tfw` + `.prj`) sulla finestra, oppure usa *File…* / *Cartella…*.
+
+   In entrambi i casi la GUI mostra CRS, dimensione e risoluzione e disegna subito l'anteprima su **OpenStreetMap**.
 2. **Tiles**: lo zoom massimo è calcolato dalla risoluzione del raster (*Auto*) con la stima del numero di tiles; scegli formato (PNG/WebP/JPEG) e compatibilità (XYZ per Google Maps/OSM/Leaflet, TMS per OpenLayers/Cesium).
 3. **Genera tiles**: barra di avanzamento e, a fine lavoro, le tiles compaiono nella mappa (livello *Tiles generate*). *Dettagli* mostra il log; *Opzioni avanzate* contiene processi, resampling e ripresa.
 
 Se il raster **non è georeferenziato** (es. disegno scansionato) compare il pannello *Posizionamento approssimato*: clicca sulla mappa per scegliere il punto, poi regola scala e rotazione: l'anteprima si aggiorna da sola (il bianco del disegno diventa trasparente per confrontarlo con la mappa). Le impostazioni principali vengono ricordate tra le sessioni. La GUI lancia `main.py`, quindi i due sono sempre allineati.
+
+> [!NOTE]
+> I dati scaricati hanno le proprie licenze d'uso: Sentinel-2 è libero (Copernicus); per l'ortofoto AGEA 2012 del Geoportale Nazionale verifica le condizioni di utilizzo prima di ridistribuire le tiles. Il tool non scarica tiles di Google, Bing o OSM, i cui termini lo vietano. La ricerca dei luoghi usa Nominatim (OpenStreetMap), pensato per un uso interattivo.
 
 Il pannello della mappa richiede internet (mappa base OSM e Leaflet). `preview.py` serve la pagina da un server HTTP locale perché i tile server di OSM rifiutano le richieste senza Referer (cioè da `file://`).
 

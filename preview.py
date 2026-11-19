@@ -37,7 +37,10 @@ if (blend) Object.keys(overlays).forEach(function(k) {
 L.control.layers({'OpenStreetMap': osm}, overlays, {collapsed: false}).addTo(map);
 var h = location.hash.slice(1).split('/');  // #zoom/lat/lon: mantiene la vista tra un aggiornamento e l altro
 if (h.length === 3) map.setView([+h[1], +h[2]], +h[0]); else map.fitBounds(b);
-map.on('moveend', function() { var c = map.getCenter(); fetch('view?lat=' + c.lat + '&lon=' + c.lng + '&z=' + map.getZoom()); });
+map.on('moveend', function() {
+  var c = map.getCenter(), bb = map.getBounds();
+  fetch('view?lat=' + c.lat + '&lon=' + c.lng + '&z=' + map.getZoom() + '&s=' + bb.getSouth() + '&w=' + bb.getWest() + '&n=' + bb.getNorth() + '&e=' + bb.getEast());
+});
 var marker = null;
 if (pick) {
   map.getContainer().style.cursor = 'crosshair';
@@ -159,17 +162,22 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
 class Preview:
     """Server HTTP locale (serve per il Referer richiesto dai tile server OSM) + pagina Leaflet."""
 
-    def __init__(self, on_pick=None):
+    def __init__(self, on_pick=None, on_view=None):
         self.dir = tempfile.mkdtemp(prefix="geotiff_preview_")
         self.server = None
         self.lock = threading.Lock()
         self.on_pick = on_pick  # callable(lat, lon)
         self.view = None        # (lat, lon, zoom) corrente della mappa
+        self.on_view = on_view  # callable() a ogni movimento della mappa
+        self.view_bounds = None  # (ovest, sud, est, nord) dell area visibile
         self.info = {}          # bounds, res_m, lat dell ultima anteprima
 
     def _event(self, name, q):
         if name == "view":
             self.view = (q["lat"], q["lon"], int(q["z"]))
+            self.view_bounds = (q["w"], q["s"], q["e"], q["n"])
+            if self.on_view:
+                self.on_view()
         elif self.on_pick:
             self.on_pick(q["lat"], q["lon"])
 

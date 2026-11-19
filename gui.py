@@ -12,9 +12,10 @@ from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout, QFrame, QGroupBox, QHBoxLayout,
     QLabel, QLineEdit, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea, QSlider, QSpinBox,
-    QSplitter, QVBoxLayout, QWidget,
+    QSplitter, QTabWidget, QVBoxLayout, QWidget,
 )
 
+import download
 import georef
 from preview import Preview, native_zoom, pixel_size_m, tile_count
 
@@ -30,10 +31,6 @@ FORMATS = [("PNG  ·  qualità massima, con trasparenza", "png"),
 SCHEMES = [("Google Maps / OpenStreetMap / Leaflet  (XYZ)", "xyz"),
            ("TMS  ·  OpenLayers TMS, Cesium, GeoServer", "tms")]
 RESAMPLINGS = ["near", "bilinear", "cubic", "cubicspline", "lanczos", "average"]
-
-PLACEHOLDER = """<body style="font-family:Segoe UI,sans-serif;margin:0;height:100vh;display:grid;place-items:center;color:#888">
-<div style="text-align:center"><h2 style="font-weight:500">Trascina qui un GeoTIFF o una cartella</h2>
-<p>oppure usa i pulsanti <b>File…</b> / <b>Cartella…</b></p></div></body>"""
 
 
 class Page(QWebEnginePage):
@@ -89,6 +86,10 @@ class Window(QWidget):
     inspected = Signal(int, object, str)       # generazione, info, errore
     preview_ready = Signal(int, str, str)      # generazione, URL, errore
     picked = Signal(float, float)              # punto scelto con un clic sulla mappa
+    view_changed = Signal()                    # la mappa è stata spostata o ingrandita
+    located = Signal(str, object, str)         # nome, bbox, errore (ricerca luogo)
+    downloaded = Signal(str, str, str)         # percorso, descrizione, errore
+    dl_progress = Signal(float)
 
     def __init__(self):
         super().__init__()
@@ -96,7 +97,7 @@ class Window(QWidget):
         self.resize(1320, 800)
         self.setAcceptDrops(True)
         self.settings = QSettings("geotiff_tiling", "gui")
-        self.preview = Preview(on_pick=self.picked.emit)
+        self.preview = Preview(on_pick=self.picked.emit, on_view=self.view_changed.emit)
         self.proc = None
         self.info = None           # risultato di inspect() sulla sorgente corrente
         self.gen = 0               # scarta i risultati di lavori superati
@@ -110,7 +111,7 @@ class Window(QWidget):
         self.web = QWebEngineView()
         self.web.setPage(Page(self.web, self.set_source))
         self.web.settings().setAttribute(QWebEngineSettings.LocalContentCanAccessRemoteUrls, True)
-        self.web.setHtml(PLACEHOLDER)
+        self.web.setUrl(QUrl(self.preview.build(None)))  # mappa navigabile da cui scegliere l area
 
         scroll = QScrollArea(); scroll.setWidget(left); scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame); scroll.setMinimumWidth(470)
@@ -122,6 +123,10 @@ class Window(QWidget):
         self.inspected.connect(self.on_inspected)
         self.preview_ready.connect(self.on_preview_ready)
         self.picked.connect(self.on_picked)
+        self.view_changed.connect(self.update_area)
+        self.located.connect(self.on_located)
+        self.downloaded.connect(self.on_downloaded)
+        self.dl_progress.connect(lambda p: self.dl_bar.setValue(int(p * 100)))
         self.debounce = QTimer(self, singleShot=True, interval=500)  # anteprima live mentre si regolano i campi
         self.debounce.timeout.connect(lambda: self.refresh_preview(keep_view=True))
         self._load_settings()
@@ -131,14 +136,34 @@ class Window(QWidget):
         w = QWidget()
         lay = QVBoxLayout(w)
 
-        # 1 · Sorgente
+        # 1 · Sorgente: scarica online (predefinito) oppure file personalizzato
+        self.search = QLineEdit(); self.search.setPlaceholderText("Cerca un luogo o inserisci LAT, LON  (es. Pozzuoli  oppure  40.84, 14.09)")
+        self.search.returnPressed.connect(self.do_search)
+        b_search = QPushButton("Cerca"); b_search.clicked.connect(self.do_search)
+        srow = QHBoxLayout(); srow.addWidget(self.search, 1); srow.addWidget(b_search)
+        self.dl_source = QComboBox()
+        for key, src in download.SOURCES.items():
+            self.dl_source.addItem(src["label"], key)
+        self.dl_source.currentIndexChanged.connect(self.update_area)
+        self.area_label = QLabel("Sposta e ingrandisci la mappa sull area che ti interessa."); self.area_label.setWordWrap(True)
+        self.dl_button = QPushButton("Scarica l area visibile"); self.dl_button.setMinimumHeight(32)
+        self.dl_button.clicked.connect(self.download_area)
+        self.dl_bar = QProgressBar(); self.dl_bar.setRange(0, 100); self.dl_bar.setVisible(False)
+        online = QWidget(); ol = QVBoxLayout(online)
+        ol.addLayout(srow); ol.addWidget(self.dl_source); ol.addWidget(self.area_label)
+        ol.addWidget(self.dl_button); ol.addWidget(self.dl_bar)
+
         self.source = QLineEdit(); self.source.setPlaceholderText("Trascina qui un GeoTIFF o una cartella (.tif + .tfw + .prj)")
         self.source.editingFinished.connect(lambda: self.set_source(self.source.text()))
         b_file = QPushButton("File…"); b_file.clicked.connect(self._pick_file)
         b_dir = QPushButton("Cartella…"); b_dir.clicked.connect(self._pick_dir)
+        custom = QWidget(); cl = QVBoxLayout(custom)
         row = QHBoxLayout(); row.addWidget(self.source, 1); row.addWidget(b_file); row.addWidget(b_dir)
+        cl.addLayout(row); cl.addStretch()
+
+        self.tabs = QTabWidget(); self.tabs.addTab(online, "Scarica online"); self.tabs.addTab(custom, "File personalizzato")
         self.summary = QLabel(); self.summary.setWordWrap(True); self.summary.setTextFormat(Qt.RichText)
-        g1 = QGroupBox("Sorgente"); l1 = QVBoxLayout(g1); l1.addLayout(row); l1.addWidget(self.summary)
+        g1 = QGroupBox("Sorgente"); l1 = QVBoxLayout(g1); l1.addWidget(self.tabs); l1.addWidget(self.summary)
         lay.addWidget(g1)
 
         # 2 · Posizionamento (solo per raster non georeferenziati)
@@ -265,6 +290,67 @@ class Window(QWidget):
         path = QFileDialog.getExistingDirectory(self, "Cartella output", self.output.text())
         if path:
             self.output.setText(os.path.normpath(path))
+
+    # ---------------------------------------------------------------- ricerca e download online
+    def do_search(self):
+        q = self.search.text().strip()
+        if not q:
+            return
+        self.set_status("Cerco…")
+
+        def work():
+            try:
+                name, bbox = download.geocode(q)
+                self.located.emit(name, bbox, "")
+            except Exception as e:
+                self.located.emit("", None, str(e))
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_located(self, name, bbox, err):
+        if err:
+            self.set_status(f"Ricerca non riuscita: {err}", error=True)
+            return
+        w, s, e, n = bbox
+        self.web.page().runJavaScript(f"map.fitBounds([[{s},{w}],[{n},{e}]]);")
+        self.set_status(f"Trovato: {name}. Regola la vista e premi «Scarica l area visibile».")
+
+    def update_area(self):
+        b = self.preview.view_bounds
+        if not b:
+            return
+        res = download.SOURCES[self.dl_source.currentData()]["res"]
+        wm, hm = download.size_m(b)
+        wpx, hpx = download.size_px(b, res)
+        big = wpx * hpx > download.MAX_PIXELS
+        text = f"Area visibile: {wm / 1000:.2f} × {hm / 1000:.2f} km  →  {wpx:,} × {hpx:,} px".replace(",", ".")
+        if big:
+            text = f"<span style='color:#e5484d'>{text}<br>troppo grande: ingrandisci la mappa</span>"
+        self.area_label.setText(text)
+        self.dl_button.setEnabled(not big and not self.dl_bar.isVisible())
+
+    def download_area(self):
+        bbox, key = self.preview.view_bounds, self.dl_source.currentData()
+        if not bbox:
+            return
+        self.dl_button.setEnabled(False); self.dl_bar.setValue(0); self.dl_bar.setVisible(True)
+        self.set_status("Download in corso…")
+
+        def work():
+            try:
+                path, desc = download.fetch(key, bbox, os.path.join(HERE, "downloads"), progress=self.dl_progress.emit)
+                self.downloaded.emit(path, desc, "")
+            except Exception as e:
+                self.downloaded.emit("", "", str(e))
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_downloaded(self, path, desc, err):
+        self.dl_bar.setVisible(False)
+        self.dl_button.setEnabled(True)
+        if err:
+            self.set_status(f"Download non riuscito: {err}", error=True)
+            return
+        self.set_status(f"Scaricato: {desc}")
+        self.set_source(path)
 
     def set_source(self, path):
         path = os.path.normpath(path.strip().strip('"')) if path.strip() else ""
@@ -470,7 +556,8 @@ class Window(QWidget):
         self.proc.start(sys.executable, args)
 
     def _set_running(self, running):
-        for w in (self.source, self.point, self.scale, self.rot, self.rot_slider, self.dpi, self.crop, self.anchor,
+        self.tabs.setEnabled(not running)
+        for w in (self.point, self.scale, self.rot, self.rot_slider, self.dpi, self.crop, self.anchor,
                   self.zmin, self.zmax, self.fmt, self.scheme, self.output, self.procs, self.resampling, self.resume):
             w.setEnabled(not running)
         self.start.setVisible(not running); self.cancel.setVisible(running); self.bar.setVisible(running)
